@@ -1,0 +1,170 @@
+import requests
+import sqlite3
+import json
+from datetime import datetime, timedelta
+
+# API setup
+API_KEY = "XPTKG1CQYLRNDK6K"  # Replace with your Alpha Vantage API key
+BASE_URL = "https://www.alphavantage.co/query"
+SYMBOL = "SPY"
+
+# Database setup
+DB_FILE = "options_data.db"
+TABLE_NAME = "raw_options_data"
+
+def create_database():
+    """Creates the database and table if it does not exist."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute(f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        contractID TEXT PRIMARY KEY,
+        symbol TEXT,
+        expiration TEXT,
+        strike REAL,
+        type TEXT,
+        last REAL,
+        mark REAL,
+        bid REAL,
+        bid_size INTEGER,
+        ask REAL,
+        ask_size INTEGER,
+        volume INTEGER,
+        open_interest INTEGER,
+        date TEXT,
+        implied_volatility REAL,
+        delta REAL,
+        gamma REAL,
+        theta REAL,
+        vega REAL,
+        rho REAL
+    );
+    """)
+    conn.close()
+    print(f"Database '{DB_FILE}' and table '{TABLE_NAME}' are ready.")
+
+def fetch_data_for_date(date):
+    """Fetch data from Alpha Vantage API for a specific date."""
+    print(f"Starting API request for {date}...")
+    params = {
+        "function": "HISTORICAL_OPTIONS",
+        "symbol": SYMBOL,
+        "date": date,
+        "apikey": API_KEY,
+        "datatype": "json"
+    }
+
+    response = requests.get(BASE_URL, params=params)
+
+    if response.status_code != 200:
+        print(f"HTTP Error: {response.status_code}")
+        print(f"Response text: {response.text}")
+        return None
+
+    try:
+        data = response.json()
+        print(f"Fetched data for {date}.")
+        if not data:
+            print("Empty response received from the API.")
+            return None
+        return data
+    except Exception as e:
+        print(f"Unexpected error during API response parsing: {e}")
+        return None
+
+def save_to_database(data, date):
+    """Save fetched data into the database."""
+    rows = []
+
+    # Handle the data structure dynamically based on the actual response
+    if isinstance(data, list):  # If the data is a list of contracts
+        rows = data
+    elif isinstance(data, dict):  # If the data contains keys like `optionChain`
+        for key, value in data.items():
+            if isinstance(value, list):
+                rows.extend(value)
+            else:
+                print(f"Unexpected structure for key '{key}': {type(value)}")
+    else:
+        print(f"Unexpected data format: {type(data)}")
+        return
+
+    if not rows:
+        print(f"No valid data to save for {date}.")
+        return
+
+    # Prepare rows for database insertion
+    prepared_rows = []
+    for row in rows:
+        try:
+            prepared_row = (
+                row.get("contractID"),
+                row.get("symbol"),
+                row.get("expiration"),
+                float(row.get("strike", 0.0)),
+                row.get("type"),
+                float(row.get("last", 0.0)),
+                float(row.get("mark", 0.0)),
+                float(row.get("bid", 0.0)),
+                int(row.get("bid_size", 0)),
+                float(row.get("ask", 0.0)),
+                int(row.get("ask_size", 0)),
+                int(row.get("volume", 0)),
+                int(row.get("open_interest", 0)),
+                date,
+                float(row.get("implied_volatility", 0.0)),
+                float(row.get("delta", 0.0)),
+                float(row.get("gamma", 0.0)),
+                float(row.get("theta", 0.0)),
+                float(row.get("vega", 0.0)),
+                float(row.get("rho", 0.0))
+            )
+            prepared_rows.append(prepared_row)
+        except Exception as e:
+            print(f"Error preparing row: {row}")
+            print(f"Error: {e}")
+
+    # Save rows to the database
+    if prepared_rows:
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            conn.executemany(f"""
+            INSERT OR IGNORE INTO {TABLE_NAME} (
+                contractID, symbol, expiration, strike, type, last, mark, bid, bid_size, ask, ask_size, volume,
+                open_interest, date, implied_volatility, delta, gamma, theta, vega, rho
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, prepared_rows)
+            conn.commit()
+            print(f"Inserted {len(prepared_rows)} rows into the database for {date}.")
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+        finally:
+            conn.close()
+    else:
+        print(f"No rows to insert into the database for {date}.")
+
+def get_previous_trading_date(start_date):
+    """Get the previous trading date."""
+    current_date = datetime.strptime(start_date, "%Y-%m-%d")
+    previous_date = current_date - timedelta(days=1)
+    return previous_date.strftime("%Y-%m-%d")
+
+def main():
+    """Main function to fetch and store data for all available dates."""
+    create_database()  # Ensure database and table are ready
+
+    # Start with the most recent date (today)
+    current_date = datetime.today().strftime("%Y-%m-%d")
+
+    while True:
+        data = fetch_data_for_date(current_date)
+        if data:
+            save_to_database(data, current_date)
+        else:
+            print(f"No data available for {current_date}. Ending process.")
+            break  # Stop if no data is returned
+
+        # Move to the previous trading date
+        current_date = get_previous_trading_date(current_date)
+
+if __name__ == "__main__":
+    main()
