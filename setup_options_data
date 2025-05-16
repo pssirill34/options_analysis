@@ -1,0 +1,171 @@
+import requests
+import sqlite3
+from datetime import datetime, timedelta
+import logging
+import time
+
+# API setup
+API_KEY = "XPTKG1CQYLRNDK6K"  # Replace with your actual Alpha Vantage API key
+BASE_URL = "https://www.alphavantage.co/query"
+SYMBOL = "SPY"
+
+# Database setup
+DB_FILE = "options_data.db"
+TABLE_NAME = "raw_options_data"
+
+# Logging setup
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Rate limit and retry settings
+REQUEST_DELAY = 1.1  # Minimum delay between API requests (in seconds)
+
+def is_trading_day(date):
+    """Check if a date is a trading day (weekdays only)."""
+    return date.weekday() < 5  # Monday (0) to Friday (4)
+
+def get_trading_days(start_date, end_date):
+    """Get all trading days between start_date and end_date."""
+    current_date = start_date
+    trading_days = []
+    while current_date <= end_date:
+        if is_trading_day(current_date):
+            trading_days.append(current_date.strftime("%Y-%m-%d"))
+        current_date += timedelta(days=1)
+    return trading_days
+
+def fetch_data_for_date(date):
+    """Fetch data from Alpha Vantage API for a specific date."""
+    logging.info(f"Fetching data for date: {date}...")
+    params = {
+        "function": "HISTORICAL_OPTIONS",
+        "symbol": SYMBOL,
+        "date": date,
+        "apikey": API_KEY,
+        "datatype": "json"
+    }
+
+    try:
+        response = requests.get(BASE_URL, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if "data" in data and isinstance(data["data"], list):
+                logging.info(f"Fetched {len(data['data'])} contracts for {date}.")
+                return data["data"]
+            else:
+                logging.warning(f"No valid options data found for {date}. Response: {data}")
+        else:
+            logging.error(f"HTTP Error {response.status_code} for {date}. Response: {response.text}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request failed for {date}: {e}")
+
+    return []
+
+def create_database():
+    """Creates the database and table if it does not exist."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute(f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        contractID TEXT,
+        symbol TEXT,
+        expiration TEXT,
+        strike REAL,
+        type TEXT,
+        quote_date TEXT,
+        last REAL,
+        bid REAL,
+        ask REAL,
+        volume INTEGER,
+        open_interest INTEGER,
+        implied_volatility REAL,
+        delta REAL,
+        gamma REAL,
+        theta REAL,
+        vega REAL,
+        rho REAL,
+        PRIMARY KEY (contractID, quote_date)
+    );
+    """)
+    conn.close()
+    logging.info(f"Database '{DB_FILE}' and table '{TABLE_NAME}' are ready.")
+
+def save_to_database(data, quote_date):
+    """Save fetched data into the database."""
+    if not data:
+        logging.warning(f"No valid data to save for {quote_date}.")
+        return
+
+    prepared_rows = []
+    for row in data:
+        try:
+            prepared_row = (
+                row.get("contractID"),
+                row.get("symbol"),
+                row.get("expiration"),
+                float(row.get("strike", 0.0)),
+                row.get("type"),
+                quote_date,
+                float(row.get("last", 0.0)),
+                float(row.get("bid", 0.0)),
+                float(row.get("ask", 0.0)),
+                int(row.get("volume", 0)),
+                int(row.get("open_interest", 0)),
+                float(row.get("implied_volatility", 0.0)),
+                float(row.get("delta", 0.0)),
+                float(row.get("gamma", 0.0)),
+                float(row.get("theta", 0.0)),
+                float(row.get("vega", 0.0)),
+                float(row.get("rho", 0.0))
+            )
+            prepared_rows.append(prepared_row)
+        except Exception as e:
+            logging.error(f"Error preparing row: {row}")
+            logging.error(f"Error: {e}")
+
+    if prepared_rows:
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            conn.executemany(f"""
+            INSERT OR IGNORE INTO {TABLE_NAME} (
+                contractID, symbol, expiration, strike, type, quote_date,
+                last, bid, ask, volume, open_interest, implied_volatility,
+                delta, gamma, theta, vega, rho
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, prepared_rows)
+            conn.commit()
+            logging.info(f"Inserted {len(prepared_rows)} rows into the database for {quote_date}.")
+        except sqlite3.Error as e:
+            logging.error(f"Database error: {e}")
+        finally:
+            conn.close()
+
+def main():
+    """Main function to fetch and store monthly options data for 2020–2024."""
+    create_database()  # Ensure database and table are ready
+
+    start_date = datetime(2020, 1, 1)
+    end_date = datetime(2024, 12, 31)
+    trading_days = get_trading_days(start_date, end_date)
+    logging.info(f"Fetching data for trading days from 2020 to 2024: {len(trading_days)} days.")
+
+    for date in trading_days:
+        contracts = fetch_data_for_date(date)
+        if contracts:
+            logging.info(f"Processing {len(contracts)} contracts for {date}...")
+
+            # Filter contracts to include only monthly expirations (third Friday of each month)
+            filtered_contracts = [
+                c for c in contracts if c.get("expiration") and datetime.strptime(c.get("expiration"), "%Y-%m-%d").weekday() == 4
+                and int(datetime.strptime(c.get("expiration"), "%Y-%m-%d").day) in range(15, 22)
+            ]
+            logging.info(f"Found {len(filtered_contracts)} monthly contracts for {date}.")
+
+            # Save the data to the database
+            save_to_database(filtered_contracts, date)
+        else:
+            logging.warning(f"No contracts fetched for {date}.")
+
+        # Add a delay to comply with API rate limits
+        time.sleep(REQUEST_DELAY)
+
+if __name__ == "__main__":
+    main()
