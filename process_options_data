@@ -1,0 +1,239 @@
+import sqlite3
+import pandas as pd
+import numpy as np
+
+# File paths
+RAW_DB_FILE = "options_data.db"
+PROCESSED_DB_FILE = "processed_options_data.db"
+HV_DATA_FILE = "hv_data_cleaned.csv"
+
+def create_processed_table():
+    """Creates the processed_options_data table in the new SQLite database."""
+    conn = sqlite3.connect(PROCESSED_DB_FILE)
+    try:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS processed_options_data (
+            QUOTE_DATE TEXT,
+            EXPIRE_DATE TEXT,
+            UNDERLYING_LAST REAL,
+            STRIKE REAL,
+            DTE INTEGER,
+            C_DELTA REAL,
+            C_GAMMA REAL,
+            C_THETA REAL,
+            C_IV REAL,
+            C_LAST REAL,
+            C_VOLUME REAL,
+            P_DELTA REAL,
+            P_GAMMA REAL,
+            P_THETA REAL,
+            P_IV REAL,
+            P_LAST REAL,
+            P_VOLUME REAL,
+            STRIKE_DISTANCE REAL,
+            STRIKE_DISTANCE_PCT REAL,
+            COMBINED_GAMMA REAL,
+            WEIGHTED_DELTA REAL,
+            WEIGHTED_THETA REAL,
+            COMBINED_PRICE REAL,
+            IV_RATIO REAL,
+            HV_10 REAL,
+            HV_20 REAL,
+            HV_30 REAL,
+            HV_AVERAGE REAL,
+            TOTAL_P_C_RATIO REAL,
+            CONTRACT_P_C_RATIO REAL,
+            TOTAL_OI_RATIO REAL,
+            CONTRACT_OI_RATIO REAL,
+            C_OPEN_INTEREST REAL,
+            P_OPEN_INTEREST REAL,
+            COMBINED_OPEN_INTEREST REAL
+        );
+        """)
+        print(f"Database '{PROCESSED_DB_FILE}' created successfully with table 'processed_options_data'.")
+    except Exception as e:
+        print(f"Error creating the database: {e}")
+    finally:
+        conn.close()
+
+def load_raw_data():
+    """Loads raw data from the original SQLite database."""
+    conn = sqlite3.connect(RAW_DB_FILE)
+    try:
+        raw_data = pd.read_sql_query("SELECT * FROM raw_options_data", conn)
+        print("Raw data loaded successfully.")
+        return raw_data
+    except Exception as e:
+        print(f"Error loading raw data: {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+def load_hv_data():
+    """Loads the HV data from the CSV file."""
+    try:
+        hv_data = pd.read_csv(HV_DATA_FILE, parse_dates=["QUOTE_DATE"])
+        print("HV data loaded successfully.")
+        return hv_data
+    except Exception as e:
+        print(f"Error loading HV data: {e}")
+        return pd.DataFrame()
+
+def process_data(raw_data, hv_data):
+    """Processes raw data and integrates with HV data."""
+    print("Processing data...")
+
+    # Convert dates in raw data
+    raw_data["quote_date"] = pd.to_datetime(raw_data["quote_date"], errors="coerce")
+    raw_data["expiration"] = pd.to_datetime(raw_data["expiration"], errors="coerce")
+
+    # Drop rows with invalid dates
+    raw_data = raw_data.dropna(subset=["quote_date", "expiration"])
+
+    # Align time zones for raw data
+    raw_data["quote_date"] = raw_data["quote_date"].dt.tz_localize("UTC")  # Ensure it is timezone-aware
+    raw_data["expiration"] = raw_data["expiration"].dt.tz_localize("UTC")  # Ensure it is timezone-aware
+
+    # Ensure QUOTE_DATE in HV data is timezone-aware
+    if hv_data["QUOTE_DATE"].dt.tz is None:
+        hv_data["QUOTE_DATE"] = hv_data["QUOTE_DATE"].dt.tz_localize("UTC")
+    else:
+        hv_data["QUOTE_DATE"] = hv_data["QUOTE_DATE"].dt.tz_convert("UTC")
+
+    # Split raw data into calls and puts
+    calls = raw_data[raw_data["type"] == "call"].copy()
+    puts = raw_data[raw_data["type"] == "put"].copy()
+
+    # Rename columns for calls and puts
+    calls.rename(columns={
+        "delta": "delta_call",
+        "gamma": "gamma_call",
+        "theta": "theta_call",
+        "implied_volatility": "implied_volatility_call",
+        "last": "last_call",
+        "volume": "volume_call",
+        "open_interest": "open_interest_call"
+    }, inplace=True)
+
+    puts.rename(columns={
+        "delta": "delta_put",
+        "gamma": "gamma_put",
+        "theta": "theta_put",
+        "implied_volatility": "implied_volatility_put",
+        "last": "last_put",
+        "volume": "volume_put",
+        "open_interest": "open_interest_put"
+    }, inplace=True)
+
+    # Merge calls and puts on common identifiers
+    merged_raw_data = pd.merge(
+        calls,
+        puts,
+        on=["quote_date", "expiration", "strike", "symbol"],
+        suffixes=("", "_put"),
+        how="outer"
+    )
+
+    # Calculate DTE (Days to Expiration)
+    merged_raw_data["DTE"] = (merged_raw_data["expiration"] - merged_raw_data["quote_date"]).dt.days
+
+    # Merge with HV data on QUOTE_DATE
+    merged_data = pd.merge(
+        merged_raw_data,
+        hv_data,
+        left_on="quote_date",
+        right_on="QUOTE_DATE",
+        how="left"
+    )
+
+    # Calculate total P/C volume ratio for each QUOTE_DATE
+    total_volume = merged_data.groupby("quote_date")[["volume_call", "volume_put"]].sum()
+    total_volume["TOTAL_P_C_RATIO"] = total_volume["volume_put"] / total_volume["volume_call"]
+    total_volume.reset_index(inplace=True)
+
+    # Map total P/C ratios to the merged data
+    merged_data = pd.merge(
+        merged_data,
+        total_volume[["quote_date", "TOTAL_P_C_RATIO"]],
+        on="quote_date",
+        how="left"
+    )
+
+    # Calculate contract-level P/C ratio
+    merged_data["CONTRACT_P_C_RATIO"] = merged_data["volume_put"] / merged_data["volume_call"]
+
+    # Calculate total OI ratio for each QUOTE_DATE
+    total_open_interest = merged_data.groupby("quote_date")[["open_interest_call", "open_interest_put"]].sum()
+    total_open_interest["TOTAL_OI_RATIO"] = total_open_interest["open_interest_put"] / total_open_interest["open_interest_call"]
+    total_open_interest.reset_index(inplace=True)
+
+    # Map total OI ratios to the merged data
+    merged_data = pd.merge(
+        merged_data,
+        total_open_interest[["quote_date", "TOTAL_OI_RATIO"]],
+        on="quote_date",
+        how="left"
+    )
+
+    # Calculate contract-level OI ratio
+    merged_data["CONTRACT_OI_RATIO"] = merged_data["open_interest_put"] / merged_data["open_interest_call"]
+
+    # Calculate additional metrics
+    merged_data["STRIKE_DISTANCE"] = abs(merged_data["strike"] - merged_data["UNDERLYING_LAST"])
+    merged_data["STRIKE_DISTANCE_PCT"] = merged_data["STRIKE_DISTANCE"] / merged_data["UNDERLYING_LAST"]
+    merged_data["COMBINED_GAMMA"] = merged_data["gamma_call"] + merged_data["gamma_put"]
+    merged_data["WEIGHTED_DELTA"] = merged_data["delta_call"] * merged_data["volume_call"]
+    merged_data["WEIGHTED_THETA"] = merged_data["theta_call"] * merged_data["volume_call"]
+    merged_data["COMBINED_PRICE"] = merged_data["last_call"] + merged_data["last_put"]
+
+    # Select and rename columns for the processed table
+    processed_data = merged_data[[
+        "quote_date", "expiration", "UNDERLYING_LAST", "strike", "DTE",
+        "delta_call", "gamma_call", "theta_call", "implied_volatility_call", "last_call", "volume_call",
+        "delta_put", "gamma_put", "theta_put", "implied_volatility_put", "last_put", "volume_put",
+        "STRIKE_DISTANCE", "STRIKE_DISTANCE_PCT", "COMBINED_GAMMA", "WEIGHTED_DELTA",
+        "WEIGHTED_THETA", "COMBINED_PRICE", "implied_volatility_call", "implied_volatility_put",
+        "HV_10", "HV_20", "HV_30", "AVERAGE_HV", "TOTAL_P_C_RATIO",
+        "CONTRACT_P_C_RATIO", "TOTAL_OI_RATIO", "CONTRACT_OI_RATIO",
+        "open_interest_call", "open_interest_put"
+    ]]
+
+    processed_data.columns = [
+        "QUOTE_DATE", "EXPIRE_DATE", "UNDERLYING_LAST", "STRIKE", "DTE",
+        "C_DELTA", "C_GAMMA", "C_THETA", "C_IV", "C_LAST", "C_VOLUME",
+        "P_DELTA", "P_GAMMA", "P_THETA", "P_IV", "P_LAST", "P_VOLUME",
+        "STRIKE_DISTANCE", "STRIKE_DISTANCE_PCT", "COMBINED_GAMMA", "WEIGHTED_DELTA",
+        "WEIGHTED_THETA", "COMBINED_PRICE", "IV_RATIO", "IV_AVERAGE",
+        "HV_10", "HV_20", "HV_30", "HV_AVERAGE", "TOTAL_P_C_RATIO",
+        "CONTRACT_P_C_RATIO", "TOTAL_OI_RATIO", "CONTRACT_OI_RATIO",
+        "C_OPEN_INTEREST", "P_OPEN_INTEREST"
+    ]
+
+    print("Data processing complete.")
+    return processed_data
+
+def save_processed_data(processed_data):
+    """Saves the processed data into the new SQLite database."""
+    conn = sqlite3.connect(PROCESSED_DB_FILE)
+    try:
+        processed_data.to_sql("processed_options_data", conn, if_exists="replace", index=False)
+        print(f"Processed data saved to 'processed_options_data' table in '{PROCESSED_DB_FILE}'.")
+    except Exception as e:
+        print(f"Error saving processed data: {e}")
+    finally:
+        conn.close()
+
+def main():
+    """Main function to process raw data and create the processed database."""
+    create_processed_table()
+    raw_data = load_raw_data()
+    hv_data = load_hv_data()
+
+    if not raw_data.empty and not hv_data.empty:
+        processed_data = process_data(raw_data, hv_data)
+        save_processed_data(processed_data)
+    else:
+        print("Missing or incomplete data. Processing aborted.")
+
+if __name__ == "__main__":
+    main()
